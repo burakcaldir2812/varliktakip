@@ -1,37 +1,35 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import os
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import streamlit.components.v1 as components 
 
 # --- PAGE SETTINGS ---
 st.set_page_config(page_title="Asset Report", page_icon="📊", layout="wide")
 
-FILE_NAME = "asset_history.csv"
+# GOOGLE SHEET NAME
+SHEET_NAME = "Varlık Takip Verileri"
+
+# --- GOOGLE SHEETS CONNECTION ---
+def get_sheet_data():
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds_dict = st.secrets["gcp_service_account"]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
+    sheet = client.open(SHEET_NAME).sheet1
+    return sheet
 
 # --- COLOR PALETTE ---
 COLORS = {
-    "Garanti Bankası": "#2ecc71",       # Green
-    "Akbank": "#e74c3c",                # Red
-    "Midas": "#3498db",                 # Light Blue
-    "IBKR": "#c0392b",                  # Dark Red
-    "Binance": "#f1c40f",               # Yellow
-    "Quantfury": "#00a8ff",             # Cyan Blue
-    "Osmanlı Yatırım": "#95a5a6",       # Grey
-    
-    # NEW BANKS
-    "BoFA": "#00205b",                  # Navy Blue
-    "Chase": "#117aca",                 # Chase Blue
-    "Sofi": "#00d5e6",                  # SoFi Turquoise
-    "Mercury": "#333333",               # Dark Grey/Black
-    
-    "Cash": "#2c3e50",                  # Dark Grey
-    "BES": "#e67e22",                   # Orange
-    "Other": "#7f8c8d"
+    "Garanti Bankası": "#2ecc71", "Akbank": "#e74c3c", "Midas": "#3498db",
+    "IBKR": "#c0392b", "Binance": "#f1c40f", "Quantfury": "#00a8ff",
+    "Osmanlı Yatırım": "#95a5a6", "BoFA": "#00205b", "Chase": "#117aca",
+    "Sofi": "#00d5e6", "Mercury": "#333333", "Cash": "#2c3e50",
+    "BES": "#e67e22", "Other": "#7f8c8d"
 }
 
-# --- INSTITUTION LIST ---
 INSTITUTIONS = [
     "Garanti Bankası", "Akbank", "Midas", "IBKR", 
     "Binance", "Quantfury", "Osmanlı Yatırım",
@@ -44,23 +42,37 @@ if "initialized" not in st.session_state:
     for k in INSTITUTIONS:
         if f"tl_{k}" not in st.session_state: st.session_state[f"tl_{k}"] = None
         if f"usd_{k}" not in st.session_state: st.session_state[f"usd_{k}"] = None
-    # Extras
     for i in range(1, 3):
         if f"tl_extra_{i}" not in st.session_state: st.session_state[f"tl_extra_{i}"] = None
         if f"usd_extra_{i}" not in st.session_state: st.session_state[f"usd_extra_{i}"] = None
-    # BES
     if "tl_bes" not in st.session_state: st.session_state.tl_bes = None
     if "usd_bes" not in st.session_state: st.session_state.usd_bes = None
 
 # --- FUNCTIONS ---
 def load_data():
-    if os.path.exists(FILE_NAME):
-        try: return pd.read_csv(FILE_NAME)
-        except: return pd.DataFrame(columns=["Date", "Institution", "TL Amount", "USD Amount"])
-    return pd.DataFrame(columns=["Date", "Institution", "TL Amount", "USD Amount"])
+    try:
+        sheet = get_sheet_data()
+        records = sheet.get_all_records()
+        if not records:
+             return pd.DataFrame(columns=["Date", "Institution", "TL Amount", "USD Amount", "USD Rate"])
+        return pd.DataFrame(records)
+    except:
+        return pd.DataFrame(columns=["Date", "Institution", "TL Amount", "USD Amount", "USD Rate"])
 
-def save_data(df):
-    df.to_csv(FILE_NAME, index=False)
+def save_data_to_sheet(new_records):
+    sheet = get_sheet_data()
+    existing_data = sheet.get_all_records()
+    df_existing = pd.DataFrame(existing_data)
+    df_new = pd.DataFrame(new_records)
+    
+    if not df_existing.empty:
+        target_date = new_records[0]["Date"]
+        df_existing = df_existing[df_existing["Date"] != target_date]
+        
+    df_final = pd.concat([df_existing, df_new], ignore_index=True)
+    sheet.clear()
+    sheet.append_row(df_final.columns.tolist())
+    sheet.append_rows(df_final.values.tolist())
 
 def clear_inputs():
     for k in INSTITUTIONS:
@@ -109,42 +121,55 @@ def usd_bes_changed():
     if usd_val is not None: st.session_state.tl_bes = usd_val * rate
     else: st.session_state.tl_bes = None
 
-# --- SAVE BUTTON ---
+# --- SAVE BUTTON LOGIC (FIXED CALCULATION) ---
 def save_and_clear(selected_date):
     rate = st.session_state.usd_rate_input
     new_records = []
+    date_str = pd.to_datetime(selected_date).strftime('%Y-%m-%d')
     
+    # --- HELPER TO CALCULATE VALUES CORRECTLY ---
+    def get_final_values(tl_key, usd_key):
+        raw_tl = st.session_state.get(tl_key)
+        raw_usd = st.session_state.get(usd_key)
+        
+        final_tl = 0
+        final_usd = 0
+        
+        # Priority: If TL exists, use it. If not, use USD and convert.
+        if raw_tl is not None and raw_tl > 0:
+            final_tl = raw_tl
+            final_usd = raw_tl / rate if rate > 0 else 0
+        elif raw_usd is not None and raw_usd > 0:
+            final_tl = raw_usd * rate
+            final_usd = raw_usd
+            
+        return final_tl, final_usd
+
+    # 1. Main Institutions
     for k in INSTITUTIONS:
-        val_tl = st.session_state.get(f"tl_{k}")
-        val_usd = st.session_state.get(f"usd_{k}")
-        if val_tl and val_tl > 0:
-            new_records.append({"Date": pd.to_datetime(selected_date).strftime('%Y-%m-%d'), "Institution": k, "TL Amount": val_tl, "USD Amount": val_usd, "USD Rate": rate})
+        f_tl, f_usd = get_final_values(f"tl_{k}", f"usd_{k}")
+        if f_tl > 0:
+            new_records.append({"Date": date_str, "Institution": k, "TL Amount": f_tl, "USD Amount": f_usd, "USD Rate": rate})
     
+    # 2. Extras
     for i in range(1, 3):
         name = st.session_state.get(f"name_extra_{i}")
-        val_tl = st.session_state.get(f"tl_extra_{i}")
-        val_usd = st.session_state.get(f"usd_extra_{i}")
-        if name and val_tl and val_tl > 0:
-            new_records.append({"Date": pd.to_datetime(selected_date).strftime('%Y-%m-%d'), "Institution": name, "TL Amount": val_tl, "USD Amount": val_usd, "USD Rate": rate})
+        f_tl, f_usd = get_final_values(f"tl_extra_{i}", f"usd_extra_{i}")
+        if name and f_tl > 0:
+            new_records.append({"Date": date_str, "Institution": name, "TL Amount": f_tl, "USD Amount": f_usd, "USD Rate": rate})
 
-    val_tl_bes = st.session_state.get("tl_bes")
-    val_usd_bes = st.session_state.get("usd_bes")
-    if val_tl_bes and val_tl_bes > 0:
-        new_records.append({"Date": pd.to_datetime(selected_date).strftime('%Y-%m-%d'), "Institution": "BES", "TL Amount": val_tl_bes, "USD Amount": val_usd_bes, "USD Rate": rate})
+    # 3. BES
+    f_tl_bes, f_usd_bes = get_final_values("tl_bes", "usd_bes")
+    if f_tl_bes > 0:
+        new_records.append({"Date": date_str, "Institution": "BES", "TL Amount": f_tl_bes, "USD Amount": f_usd_bes, "USD Rate": rate})
 
     if new_records:
-        df_new = pd.DataFrame(new_records)
-        df_old = load_data()
-        if not df_old.empty:
-            mask = df_old["Date"] != pd.to_datetime(selected_date).strftime('%Y-%m-%d')
-            df_old = df_old[mask]
-        df_final = pd.concat([df_old, df_new], ignore_index=True)
-        save_data(df_final)
-        st.success("✅ Record Saved Successfully!")
+        save_data_to_sheet(new_records)
+        st.success("✅ Saved to Google Sheets!")
     clear_inputs()
 
 # --- UI STARTS ---
-st.title("📊 Visual Asset Report")
+st.title("📊 Visual Asset Report (Cloud)")
 
 with st.expander("➕ New Entry / Edit", expanded=False):
     c1, c2 = st.columns(2)
@@ -153,7 +178,6 @@ with st.expander("➕ New Entry / Edit", expanded=False):
     
     st.markdown("---")
     st.write("###### Main Assets")
-    
     for inst in INSTITUTIONS:
         c_name, c_tl, c_usd = st.columns([1.5, 1.5, 1.5])
         c_name.write(f"**{inst}**")
@@ -186,7 +210,6 @@ if not df.empty:
     df_main = df[df["Institution"] != "BES"]
     df_bes = df[df["Institution"] == "BES"]
 
-    # 1. MAIN ASSETS CHART (TITLE UPDATED)
     st.subheader("📈 Main Asset Growth")
     if not df_main.empty:
         daily_summary = df_main.groupby("Date")[["TL Amount", "USD Amount"]].sum().reset_index()
@@ -206,24 +229,20 @@ if not df.empty:
     else:
         st.info("No main assets data.")
 
-    # 2. BES CHART (UPDATED TO BAR CHART)
     if not df_bes.empty:
         st.markdown("---")
         st.subheader("☂️ BES (Pension) Monthly Tracking")
         daily_summary_bes = df_bes.groupby("Date")[["TL Amount", "USD Amount"]].sum().reset_index()
-        
         tab_b1, tab_b2 = st.tabs(["₺ BES (TL)", "$ BES (USD)"])
         
         with tab_b1:
-            fig_bes_tl = px.bar(daily_summary_bes, x="Date", y="TL Amount", title="BES Growth (TL)", 
-                                template="plotly_white", color_discrete_sequence=["#e67e22"]) # Solid Orange
+            fig_bes_tl = px.bar(daily_summary_bes, x="Date", y="TL Amount", title="BES Growth (TL)", template="plotly_white", color_discrete_sequence=["#e67e22"])
             fig_bes_tl.update_traces(texttemplate='<b>₺%{y:,.0f}</b>', textposition='outside', marker_line_width=1.5, marker_line_color="black")
             fig_bes_tl.update_layout(xaxis_title="", yaxis_title="TL", height=400)
             st.plotly_chart(fig_bes_tl, use_container_width=True)
 
         with tab_b2:
-            fig_bes_usd = px.bar(daily_summary_bes, x="Date", y="USD Amount", title="BES Growth (USD)", 
-                                 template="plotly_white", color_discrete_sequence=["#d35400"]) # Darker Orange
+            fig_bes_usd = px.bar(daily_summary_bes, x="Date", y="USD Amount", title="BES Growth (USD)", template="plotly_white", color_discrete_sequence=["#d35400"])
             fig_bes_usd.update_traces(texttemplate='<b>$%{y:,.0f}</b>', textposition='outside', marker_line_width=1.5, marker_line_color="black")
             fig_bes_usd.update_layout(xaxis_title="", yaxis_title="USD", height=400)
             st.plotly_chart(fig_bes_usd, use_container_width=True)
@@ -235,7 +254,6 @@ if not df.empty:
     cols = st.columns(5) 
     for idx, date_str in enumerate(unique_dates):
         col_index = idx % 5
-        
         df_month = df[df["Date"] == date_str]
         df_month_main = df_month[df_month["Institution"] != "BES"]
         df_month_bes = df_month[df_month["Institution"] == "BES"]
@@ -276,8 +294,14 @@ if not df.empty:
     with st.expander("🗑️ Delete Incorrect Entry"):
         date_to_delete = st.selectbox("Select date to delete:", unique_dates)
         if st.button("🗑️ Delete Selected Date", type="primary"):
-            df = df[df["Date"] != date_to_delete]
-            save_data(df)
-            st.success("Deleted! Refreshing...")
+            sheet = get_sheet_data()
+            all_records = sheet.get_all_records()
+            df_cloud = pd.DataFrame(all_records)
+            date_str_del = pd.to_datetime(date_to_delete).strftime('%Y-%m-%d')
+            df_cloud = df_cloud[df_cloud["Date"] != date_str_del]
+            sheet.clear()
+            sheet.append_row(df_cloud.columns.tolist())
+            sheet.append_rows(df_cloud.values.tolist())
+            st.success("Deleted from Cloud! Refreshing...")
             st.rerun()
 else: st.info("No data yet.")
